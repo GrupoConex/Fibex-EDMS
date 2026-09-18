@@ -1,9 +1,10 @@
 <#
 .SYNOPSIS
-    Fibex EDMS Local Development Manager (Podman)
+    Fibex EDMS Local Development Manager (Podman & Docker compatible)
 
 .DESCRIPTION
     Helper script to run and manage Fibex EDMS in local development with live reload.
+    Supports both Podman and Docker Desktop seamlessly.
 
 .EXAMPLE
     .\dev.ps1 start       # Starts dev server with live reload
@@ -11,11 +12,12 @@
     .\dev.ps1 logs        # Follows container logs
     .\dev.ps1 shell       # Opens a bash prompt in the dev container
     .\dev.ps1 manage ...  # Runs manage.py commands (e.g. .\dev.ps1 manage check)
+    .\dev.ps1 build       # Rebuilds the dev image
 #>
 
 param (
     [Parameter(Position = 0)]
-    [ValidateSet("start", "stop", "restart", "logs", "shell", "manage", "status")]
+    [ValidateSet("start", "stop", "restart", "logs", "shell", "manage", "build", "status")]
     [string]$Action = "start",
 
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
@@ -24,33 +26,86 @@ param (
 
 $ErrorActionPreference = "Stop"
 $ContainerName = "fibex-dev"
-$ComposeFile = "docker-compose.dev.yml"
+$ImageName = "fibex-edms-app:latest"
+
+# Detect engine: prefer Podman if installed and running, otherwise Docker
+function Get-ContainerEngine {
+    $hasPodman = Get-Command podman -ErrorAction SilentlyContinue
+    if ($hasPodman) {
+        $podmanState = podman machine inspect 2>$null | ConvertFrom-Json 2>$null
+        if ($podmanState -and $podmanState[0].State -eq "running") {
+            return "podman"
+        }
+    }
+
+    $hasDocker = Get-Command docker -ErrorAction SilentlyContinue
+    if ($hasDocker) {
+        docker info 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            return "docker"
+        }
+    }
+
+    if ($hasPodman) { return "podman" }
+    if ($hasDocker) { return "docker" }
+    throw "Neither Podman nor Docker was found or running. Please start Podman or Docker Desktop."
+}
+
+$Engine = Get-ContainerEngine
+
+function Build-DevImage {
+    Write-Host ">>> Building dev image using $Engine..." -ForegroundColor Cyan
+    & $Engine build -f Dockerfile.dev -t $ImageName .
+    Write-Host ">>> Build completed: $ImageName" -ForegroundColor Green
+}
 
 function Start-DevServer {
+    Write-Host ">>> Using container engine: $Engine" -ForegroundColor DarkGray
     Write-Host ">>> Checking if $ContainerName is already running..." -ForegroundColor Cyan
-    $running = podman ps --filter "name=$ContainerName" --format "{{.Names}}"
+
+    $running = & $Engine ps --filter "name=^${ContainerName}$" --format "{{.Names}}"
     if ($running -eq $ContainerName) {
         Write-Host ">>> $ContainerName is already running at http://localhost:8000" -ForegroundColor Green
         return
     }
 
-    # Clean up any stopped container with same name
-    podman rm -f $ContainerName 2>$null | Out-Null
+    # Clean up any stopped container with the same name
+    & $Engine rm -f $ContainerName 2>$null | Out-Null
+
+    # Check if dev image exists, if not build it
+    $imageCheck = & $Engine images -q $ImageName
+    if (-not $imageCheck) {
+        Write-Host ">>> Image $ImageName not found locally. Building it first..." -ForegroundColor Yellow
+        Build-DevImage
+    }
 
     Write-Host ">>> Starting Fibex EDMS Dev Server with Live Reload..." -ForegroundColor Cyan
-    Write-Host ">>> Using network_mode: host (accessible at http://localhost:8000)" -ForegroundColor DarkGray
 
-    # Use podman run directly for maximum reliability across Windows/WSL
-    podman run -d `
-        --name $ContainerName `
-        --network host `
-        -v ".:/app:z" `
-        -w /app `
-        -e DJANGO_SETTINGS_MODULE=mayan.settings.development `
-        -e MAYAN_MEDIA_ROOT=/app/mayan/media `
-        -e PYTHONUNBUFFERED=1 `
-        fibex-edms-app:latest `
-        python manage.py runserver 0.0.0.0:8000 --settings=mayan.settings.development
+    if ($Engine -eq "podman") {
+        # On Windows with Podman, host networking maps directly to Windows localhost
+        podman run -d `
+            --name $ContainerName `
+            --network host `
+            -v ".:/app:z" `
+            -w /app `
+            -e DJANGO_SETTINGS_MODULE=mayan.settings.development `
+            -e MAYAN_MEDIA_ROOT=/app/mayan/media `
+            -e PYTHONUNBUFFERED=1 `
+            $ImageName `
+            python manage.py runserver 0.0.0.0:8000 --settings=mayan.settings.development | Out-Null
+    } else {
+        # On Docker Desktop, standard port mapping works out of the box
+        docker run -d `
+            --name $ContainerName `
+            -p 8000:8000 `
+            -v "${PWD}:/app" `
+            -w /app `
+            -e DJANGO_SETTINGS_MODULE=mayan.settings.development `
+            -e MAYAN_MEDIA_ROOT=/app/mayan/media `
+            -e PYTHONUNBUFFERED=1 `
+            $ImageName `
+            python manage.py runserver 0.0.0.0:8000 --settings=mayan.settings.development | Out-Null
+    }
 
     Write-Host ">>> Container launched. Waiting for server to initialize..." -ForegroundColor Cyan
     
@@ -73,24 +128,25 @@ function Start-DevServer {
     if ($ready) {
         Write-Host ">>> Fibex EDMS is READY at: http://localhost:8000" -ForegroundColor Green
         Write-Host ">>> Live reload is active! Edit any code in your IDE to trigger reload." -ForegroundColor Green
+        Write-Host ">>> Default login: admin / adminpassword" -ForegroundColor Green
     } else {
         Write-Host ">>> Server is still booting. Follow logs with: .\dev.ps1 logs" -ForegroundColor Yellow
     }
 }
 
 function Stop-DevServer {
-    Write-Host ">>> Stopping $ContainerName..." -ForegroundColor Cyan
-    podman stop $ContainerName 2>$null | Out-Null
-    podman rm $ContainerName 2>$null | Out-Null
+    Write-Host ">>> Stopping $ContainerName using $Engine..." -ForegroundColor Cyan
+    & $Engine stop $ContainerName 2>$null | Out-Null
+    & $Engine rm $ContainerName 2>$null | Out-Null
     Write-Host ">>> Stopped." -ForegroundColor Green
 }
 
 function Show-Logs {
-    podman logs -f $ContainerName
+    & $Engine logs -f $ContainerName
 }
 
 function Enter-Shell {
-    podman exec -it $ContainerName /bin/bash
+    & $Engine exec -it $ContainerName /bin/bash
 }
 
 function Run-Manage {
@@ -98,11 +154,11 @@ function Run-Manage {
         Write-Host "Usage: .\dev.ps1 manage <command> (e.g. .\dev.ps1 manage check)" -ForegroundColor Yellow
         return
     }
-    podman exec -it $ContainerName python manage.py $ExtraArgs
+    & $Engine exec -it $ContainerName python manage.py $ExtraArgs
 }
 
 function Show-Status {
-    podman ps --filter "name=$ContainerName"
+    & $Engine ps --filter "name=$ContainerName"
 }
 
 switch ($Action) {
@@ -112,5 +168,6 @@ switch ($Action) {
     "logs"    { Show-Logs }
     "shell"   { Enter-Shell }
     "manage"  { Run-Manage }
+    "build"   { Build-DevImage }
     "status"  { Show-Status }
 }

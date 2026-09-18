@@ -1,8 +1,12 @@
 services:
   web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
     image: fibex-edms-app:latest
     container_name: fibex-dev
-    network_mode: host
+    ports:
+      - "8000:8000"
     volumes:
       - .:/app:z
     working_dir: /app
