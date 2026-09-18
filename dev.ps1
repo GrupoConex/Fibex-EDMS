@@ -9,7 +9,9 @@
 .EXAMPLE
     .\dev.ps1 start       # Starts dev server with live reload
     .\dev.ps1 stop        # Stops the running dev container
-    .\dev.ps1 logs        # Follows container logs
+    .\dev.ps1 logs        # Follows container logs (default: last 100 lines)
+    .\dev.ps1 logs 50     # Follows container logs from last 50 lines
+    .\dev.ps1 logs all    # Follows entire container log history
     .\dev.ps1 shell       # Opens a bash prompt in the dev container
     .\dev.ps1 manage ...  # Runs manage.py commands (e.g. .\dev.ps1 manage check)
     .\dev.ps1 build       # Rebuilds the dev image
@@ -142,7 +144,14 @@ function Stop-DevServer {
 }
 
 function Show-Logs {
-    & $Engine logs -f $ContainerName
+    $lines = if ($ExtraArgs) { $ExtraArgs[0] } else { "100" }
+    if ($lines -eq "all") {
+        Write-Host ">>> Showing full log history for $ContainerName..." -ForegroundColor DarkGray
+        & $Engine logs -f $ContainerName
+    } else {
+        Write-Host ">>> Showing last $lines lines for $ContainerName (use '.\dev.ps1 logs all' for full history)..." -ForegroundColor DarkGray
+        & $Engine logs -f --tail $lines $ContainerName
+    }
 }
 
 function Enter-Shell {
